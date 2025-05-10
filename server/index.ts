@@ -1,69 +1,81 @@
-import express, { type Request, Response, NextFunction } from "express";
+import express from "express";
+import { createServer } from "http";
+import cors from "cors";
+import session from "express-session";
+import path from "path";
 import { registerRoutes } from "./routes";
-import { setupVite, serveStatic, log } from "./vite";
+import { log } from "./vite";
 
 const app = express();
+const port = process.env.PORT || 3000;
+const isDev = process.env.NODE_ENV === "development";
+
+// Middleware
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(cors({
+  origin: isDev ? ["http://localhost:5173", "http://localhost:3000"] : true,
+  credentials: true
+}));
 
-app.use((req, res, next) => {
-  const start = Date.now();
-  const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
-
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
-
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      if (logLine.length > 80) {
-        logLine = logLine.slice(0, 79) + "…";
-      }
-
-      log(logLine);
-    }
-  });
-
-  next();
-});
-
-(async () => {
-  const server = await registerRoutes(app);
-
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
-
-    res.status(status).json({ message });
-    throw err;
-  });
-
-  // importantly only setup vite in development and after
-  // setting up all the other routes so the catch-all route
-  // doesn't interfere with the other routes
-  if (app.get("env") === "development") {
-    await setupVite(app, server);
-  } else {
-    serveStatic(app);
+// Session
+app.use(session({
+  secret: process.env.SESSION_SECRET || "movie-website-secret",
+  resave: false,
+  saveUninitialized: true,
+  cookie: {
+    secure: !isDev,
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000, // 1 day
   }
+}));
 
-  // ALWAYS serve the app on port 5000
-  // this serves both the API and the client.
-  // It is the only port that is not firewalled.
-  const port = 3000;
-server.listen({
-  port,
-  host: "127.0.0.1",
-}, () => {
-  log(`serving on port ${port}`);
+// Register API routes
+registerRoutes(app)
+  .then(server => {
+    // Setup Vite dev server in development mode
+    if (isDev) {
+      import("./vite").then(({ setupVite }) => {
+        setupVite(app, server);
+      });
+    } else {
+      // Serve static files in production
+      const staticPath = path.join(__dirname, "../dist");
+      app.use(express.static(staticPath));
+      
+      // Handle SPA routes - always return index.html for any non-API path
+      app.get("*", (req, res) => {
+        // Skip API paths
+        if (req.path.startsWith("/api")) return;
+        
+        res.sendFile(path.join(staticPath, "index.html"));
+      });
+    }
+
+    // Error handling middleware
+    app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      console.error(err.stack);
+      res.status(err.status || 500).json({
+        message: err.message || "Internal Server Error",
+      });
+    });
+
+    // Start the server
+    server.listen({
+      port,
+      host: process.env.NODE_ENV === "production" ? "0.0.0.0" : "localhost",
+    }, () => {
+      log(`serving on port ${port}`);
+    });
+  })
+  .catch(err => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+  });
+
+// Handle termination signals
+process.on("SIGINT", () => {
+  log("Server shutting down...");
+  process.exit(0);
 });
-})();
+
+export { app };
